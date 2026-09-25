@@ -56,6 +56,26 @@ Requires `keyutils` for the credential cache:
 sudo pacman -S keyutils
 ```
 
+## Uninstall
+
+Remove the widget from your bar section, then:
+
+```bash
+omarchy plugin remove io.github.wizard-neteng.hussh
+```
+
+That deletes the plugin. Your imported sessions and settings live separately
+and are left alone, so reinstalling picks up where you left off. To remove
+those too:
+
+```bash
+rm -rf ~/.config/omarchy/hussh     # sessions, settings, collapsed-group state
+hussh-cred lock                    # drop any cached credential immediately
+```
+
+huSSH writes nothing outside `~/.config/omarchy/hussh/` and the plugin
+directory, and never edits your shell, SSH, or terminal configuration.
+
 ## Importing sessions
 
 Open the settings gear in the popup (or press `,`), enter a path, and choose
