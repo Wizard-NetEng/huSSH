@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -472,11 +473,27 @@ def main():
     if args.dry_run:
         print(blob)
     else:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out_path.with_suffix(".json.tmp")
-        tmp.write_text(blob)
-        os.chmod(tmp, 0o600)
-        tmp.replace(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Session inventory is host/user data: it must never exist on disk in a
+        # world-readable state, not even briefly. mkstemp creates with mode 0600
+        # atomically (O_CREAT|O_EXCL), so there is no window between create and
+        # chmod, and the random name cannot be pre-planted as a symlink for us
+        # to follow and truncate.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(out_path.parent),
+            prefix=f".{out_path.name}.",
+            suffix=".tmp",
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, out_path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
     print(f"\n{len(final)} sessions -> {out_path if not args.dry_run else '(dry run)'}",
           file=sys.stderr)
