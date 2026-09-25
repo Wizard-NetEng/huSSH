@@ -41,10 +41,12 @@ omarchy plugin clone https://github.com/Wizard-NetEng/huSSH
 
 Then add the **huSSH** widget to a bar section in Omarchy's bar settings.
 
-Requires `keyutils` for the credential cache:
+The credential cache uses `keyctl` from `keyutils`. It is already present on
+essentially every Arch desktop (`krb5` depends on it), so there is usually
+nothing to install. To confirm:
 
 ```bash
-sudo pacman -S keyutils
+command -v keyctl || echo "install keyutils with your package manager"
 ```
 
 ## Uninstall
