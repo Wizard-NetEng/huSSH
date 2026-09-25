@@ -4,21 +4,12 @@ A compact SSH client that lives in the Omarchy bar. One icon, one dropdown:
 your sessions grouped exactly as your old client had them, a reachability dot
 per host, and Enter to connect in your default terminal.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="huSSH popup showing grouped SSH sessions with reachability status" width="420">
+</p>
+
 Built for network engineers with a few hundred devices behind TACACS+ or
 RADIUS, where every box wants the same password and key auth isn't an option.
-
-```
-huSSH                              [+] [lock] [gear] [refresh]
-132 of 132 · 99 up / 33 down
-
-  Filter by name, host, group…
-
-  ▾ Ungrouped                                          3/3 up
-    ● core-sw-1          10.x.x.1
-    ● core-sw-2          10.x.x.2
-  ▸ Site A / Closet 1                                  7/7 up
-  ▸ Site A / Console                                  0/12 up
-```
 
 ## Why
 
