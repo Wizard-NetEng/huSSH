@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# hussh-connect — open an SSH/telnet session in the user's default terminal.
+#
+# Credential model (TACACS+ friendly):
+#   The password lives ONLY in the kernel user keyring (@u) with a timeout.
+#   It is never written to disk, never passed on a command line, and never
+#   exported into the environment of the ssh process itself.
+#
+#   We hand it to ssh through SSH_ASKPASS: ssh execs our helper, which pipes
+#   the key out of the keyring on stdout. Nothing else can read it without
+#   already being you.
+#
+# Usage: hussh-connect <host> <port> <user> <protocol> <title> [identity]
+
+set -euo pipefail
+
+HOST="${1:?host required}"
+PORT="${2:-22}"
+USER_NAME="${3:-}"
+PROTO="${4:-ssh}"
+TITLE="${5:-$HOST}"
+IDENTITY="${6:-}"
+
+KEY_DESC="hussh:tacacs"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ASKPASS="$SELF_DIR/hussh-askpass"
+
+# ---- build the remote command -------------------------------------------
+if [[ "$PROTO" == "telnet" ]]; then
+  REMOTE_CMD=(telnet "$HOST" "$PORT")
+else
+  REMOTE_CMD=(ssh -p "$PORT")
+  [[ -n "$IDENTITY" ]] && REMOTE_CMD+=(-i "$IDENTITY" -o IdentitiesOnly=yes)
+  # Old switches: let the system ssh_config decide on legacy algorithms.
+  if [[ -n "$USER_NAME" ]]; then
+    REMOTE_CMD+=("${USER_NAME}@${HOST}")
+  else
+    REMOTE_CMD+=("$HOST")
+  fi
+fi
+
+# ---- credential handoff --------------------------------------------------
+# Two facts about OpenSSH, both verified against 10.5 on real gear:
+#
+#   1. SSH_ASKPASS_REQUIRE=force routes EVERY prompt to the helper, including
+#      the host-key "are you sure (yes/no)" question, and there is NO tty
+#      fallback. A helper that declines it just gets "Host key verification
+#      failed" — it cannot hand the question back to the human.
+#   2. WITHOUT force, ssh only consults the helper when there is no tty. In a
+#      terminal window there always is one, so "Password:" is printed to the
+#      screen and the cached credential is never used.
+#
+# So neither mode alone works. We split it: if the host key is unknown, run a
+# short throwaway connection FIRST with no askpass, purely so the fingerprint
+# prompt reaches the human on the tty. Once that is answered the key is in
+# known_hosts, and the real session runs with force and authenticates silently.
+#
+# Accepting a host key stays a human decision — we never auto-answer it.
+USE_ASKPASS=0
+NEEDS_LEARN=0
+if [[ "$PROTO" == "ssh" && -z "$IDENTITY" ]]; then
+  if keyctl search @u user "$KEY_DESC" >/dev/null 2>&1; then
+    USE_ASKPASS=1
+    # ssh-keygen -F copes with hashed known_hosts; check the [host]:port form
+    # too, which is how non-22 ports are recorded.
+    if ! ssh-keygen -F "$HOST" >/dev/null 2>&1 \
+       && ! ssh-keygen -F "[${HOST}]:${PORT}" >/dev/null 2>&1; then
+      NEEDS_LEARN=1
+    fi
+  fi
+fi
+
+# The inner command run inside the terminal window. We deliberately keep the
+# shell alive after disconnect so you can read the last lines / scrollback.
+INNER=""
+
+if (( NEEDS_LEARN )); then
+  # Phase 1: no askpass, so the fingerprint question lands on the tty where
+  # you can read it and decide. -o BatchMode=no keeps it interactive; we ask
+  # for no command and exit immediately once the key is recorded.
+  # Target string, matching how REMOTE_CMD addresses the host above.
+  if [[ -n "$USER_NAME" ]]; then LEARN_TARGET="${USER_NAME}@${HOST}"; else LEARN_TARGET="$HOST"; fi
+  LEARN=(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=ask
+         -o NumberOfPasswordPrompts=0 -p "$PORT" "$LEARN_TARGET" -- exit)
+  INNER+='echo "[huSSH] First connection to this host — verify the fingerprint below."; echo; '
+  for a in "${LEARN[@]}"; do INNER+=" $(printf '%q' "$a")"; done
+  # NumberOfPasswordPrompts=0 means this probe always ends in an auth failure
+  # once the key is stored ("Permission denied"). That is expected and
+  # harmless. Nothing is redirected: the fingerprint question and the key
+  # itself are written to stderr and must stay visible.
+  INNER+=' || true; '
+  INNER+='echo "[huSSH] Host key recorded — connecting with your cached credential."; echo; '
+fi
+
+# Phase 2 (or the only phase): real session, credential supplied by askpass.
+if (( USE_ASKPASS )); then
+  INNER+="SSH_ASKPASS=$(printf '%q' "$ASKPASS") SSH_ASKPASS_REQUIRE=force"
+fi
+for a in "${REMOTE_CMD[@]}"; do INNER+=" $(printf '%q' "$a")"; done
+INNER+='; echo; echo "[huSSH] session ended — press Enter to close"; read -r'
+
+# ---- pick a terminal -----------------------------------------------------
+# HUSSH_PRINT_INNER=1 prints the assembled command instead of opening a
+# window. Used by the test harness so the connect logic can be exercised
+# without spawning terminals; has no effect in normal use.
+if [[ "${HUSSH_PRINT_INNER:-0}" == "1" ]]; then
+  printf '%s' "$INNER"
+  exit 0
+fi
+
+# Honour the system default first (Omarchy sets TERMINAL=xdg-terminal-exec).
+launch() {
+  if command -v xdg-terminal-exec >/dev/null 2>&1; then
+    exec xdg-terminal-exec -- bash -lc "$INNER"
+  fi
+  for t in "${TERMINAL:-}" ghostty alacritty kitty foot wezterm xterm; do
+    [[ -z "$t" ]] && continue
+    command -v "$t" >/dev/null 2>&1 || continue
+    case "$t" in
+      ghostty)   exec ghostty --title="$TITLE" -e bash -lc "$INNER" ;;
+      alacritty) exec alacritty --title "$TITLE" -e bash -lc "$INNER" ;;
+      kitty)     exec kitty --title "$TITLE" bash -lc "$INNER" ;;
+      foot)      exec foot --title="$TITLE" bash -lc "$INNER" ;;
+      wezterm)   exec wezterm start -- bash -lc "$INNER" ;;
+      xterm)     exec xterm -T "$TITLE" -e bash -lc "$INNER" ;;
+      *)         exec "$t" -e bash -lc "$INNER" ;;
+    esac
+  done
+  notify-send "hussh" "No usable terminal emulator found" 2>/dev/null || true
+  exit 1
+}
+
+launch

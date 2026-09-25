@@ -1,0 +1,17 @@
+# Python bytecode — embeds absolute source paths, must never be committed
+__pycache__/
+*.py[cod]
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Local session data never belongs in the repo. huSSH stores these under
+# ~/.config/omarchy/hussh/, but guard against a stray copy landing here.
+sessions.json
+settings.json
+ui-state.json
+*.session

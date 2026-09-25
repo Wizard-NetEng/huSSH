@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# hussh-askpass — SSH_ASKPASS helper. Prints the cached TACACS password on
+# stdout, once, straight from the kernel keyring. Never touches disk.
+#
+# ssh calls this with the prompt text as $1. We only answer password-style
+# prompts; anything else (host key confirmation, etc.) we decline so the
+# user sees it in the terminal and answers deliberately.
+
+set -euo pipefail
+KEY_DESC="hussh:tacacs"
+PROMPT="${1:-}"
+
+case "$PROMPT" in
+  *[Pp]assword*|*PASSWORD*)
+    id="$(keyctl search @u user "$KEY_DESC" 2>/dev/null)" || exit 1
+    keyctl pipe "$id" 2>/dev/null || exit 1
+    ;;
+  *)
+    # Host key prompts and friends: refuse, let ssh fall back to the tty.
+    exit 1
+    ;;
+esac

@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.wizard-neteng.hussh",
+  "name": "huSSH",
+  "version": "1.0.0",
+  "author": "Wizard-NetEng",
+  "license": "MIT",
+  "homepage": "https://github.com/Wizard-NetEng/huSSH",
+  "repository": "https://github.com/Wizard-NetEng/huSSH",
+  "description": "A compact SSH client in the bar: grouped session list imported from SecureCRT or PuTTY, live reachability dots, and one-click connect in your default terminal. TACACS credentials are held in the kernel keyring for a limited window, never written to disk.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "huSSH",
+    "description": "Dropdown of SSH sessions with reachability status and one-click connect",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "probeSeconds": 60,
+      "probeEnabled": true,
+      "probeTimeout": 1.5,
+      "unlockMinutes": 60,
+      "hideUnreachable": false
+    },
+    "schema": [
+      {
+        "key": "probeEnabled",
+        "type": "boolean",
+        "label": "Probe reachability",
+        "description": "Background TCP check of each host's SSH port to drive the status dots.",
+        "defaultValue": true
+      },
+      {
+        "key": "probeSeconds",
+        "type": "integer",
+        "label": "Probe interval (seconds)",
+        "description": "How often to re-sweep all hosts. Only runs while the popup has been opened at least once.",
+        "min": 15,
+        "max": 900,
+        "step": 5,
+        "defaultValue": 60
+      },
+      {
+        "key": "probeTimeout",
+        "type": "number",
+        "label": "Probe timeout (seconds)",
+        "description": "Per-host TCP connect timeout. Raise it on high-latency WAN links.",
+        "min": 0.3,
+        "max": 10,
+        "step": 0.1,
+        "defaultValue": 1.5
+      },
+      {
+        "key": "unlockMinutes",
+        "type": "integer",
+        "label": "Credential hold (minutes)",
+        "description": "How long the TACACS password stays cached in the kernel keyring before it expires itself.",
+        "min": 5,
+        "max": 480,
+        "step": 5,
+        "defaultValue": 60
+      },
+      {
+        "key": "hideUnreachable",
+        "type": "boolean",
+        "label": "Hide unreachable hosts",
+        "description": "Show only hosts that answered the last probe sweep.",
+        "defaultValue": false
+      }
+    ]
+  }
+}

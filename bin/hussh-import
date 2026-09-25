@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""
+hussh-import — build sessions.json from SecureCRT / PuTTY exports.
+
+SecureCRT: point at the Config/Sessions directory. Folder tree becomes groups.
+PuTTY:     point at a regedit .reg export of HKCU\\Software\\SimonTatham\\PuTTY\\Sessions
+           (or a ~/.putty/sessions directory on Linux).
+
+Passwords are NEVER imported. SecureCRT's "Password V2" blobs are left on the
+floor deliberately: TACACS credentials belong in RAM, not on disk.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.parse
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+DEFAULT_OUT = Path.home() / ".config" / "omarchy" / "hussh" / "sessions.json"
+
+
+# ---------------------------------------------------------------- SecureCRT
+
+def _crt_parse_ini(path: Path) -> dict:
+    """Parse a SecureCRT .ini into {key: value} for S: and D: scalar lines.
+
+    Format is  <TYPE>:"<Key>"=<value>  where TYPE is S (string), D (dword,
+    hex), B/Z (binary/multiline blobs we skip). Continuation lines for blobs
+    start with a space, so any line without a TYPE: prefix is skipped.
+    """
+    out = {}
+    try:
+        raw = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return out
+    for line in raw.splitlines():
+        m = re.match(r'^([SDBZ]):"([^"]+)"=(.*)$', line)
+        if not m:
+            continue  # blob continuation line or junk
+        typ, key, val = m.groups()
+        if typ == "S":
+            out[key] = val
+        elif typ == "D":
+            try:
+                out[key] = int(val, 16)  # SecureCRT stores dwords as HEX
+            except ValueError:
+                pass
+    return out
+
+
+def _crt_folder_description(folder: Path) -> str:
+    fd = folder / "__FolderData__.ini"
+    if not fd.exists():
+        return ""
+    # Description lives in a Z: blob continuation line
+    try:
+        raw = fd.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return ""
+    lines = raw.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith('Z:"Description"'):
+            if i + 1 < len(lines) and lines[i + 1].startswith(" "):
+                return lines[i + 1].strip()
+    return ""
+
+
+def import_securecrt(root: Path) -> list:
+    sessions = []
+    if not root.exists():
+        raise SystemExit(f"SecureCRT sessions dir not found: {root}")
+
+    for path in sorted(root.rglob("*.ini")):
+        if path.name == "__FolderData__.ini":
+            continue
+        cfg = _crt_parse_ini(path)
+        if not cfg:
+            continue
+        # Only real sessions
+        if cfg.get("Is Session") not in (1, None):
+            continue
+        host = (cfg.get("Hostname") or "").strip()
+        if not host:
+            continue  # local-shell or malformed entry
+
+        proto = (cfg.get("Protocol Name") or "SSH2").strip().upper()
+        if proto.startswith("SSH"):
+            proto_out = "ssh"
+        elif proto == "TELNET":
+            proto_out = "telnet"
+        else:
+            continue  # serial / rlogin / raw — not our business
+
+        port = cfg.get("[SSH2] Port") or cfg.get("[Telnet] Port") or (
+            22 if proto_out == "ssh" else 23)
+
+        rel = path.relative_to(root).parent
+        group = "/".join(rel.parts) if rel.parts else ""
+
+        # Description blob
+        desc = ""
+        try:
+            raw = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+            for i, line in enumerate(raw):
+                if line.startswith('Z:"Description"') and i + 1 < len(raw):
+                    if raw[i + 1].startswith(" "):
+                        desc = raw[i + 1].strip()
+                    break
+        except OSError:
+            pass
+
+        identity = (cfg.get("Identity Filename V2") or "").strip()
+        # Windows paths in an imported file are meaningless on Linux
+        if identity and ("\\" in identity or re.match(r"^[A-Za-z]:", identity)):
+            identity = ""
+
+        sessions.append({
+            "name": path.stem,
+            "host": host,
+            "port": int(port),
+            "user": (cfg.get("Username") or "").strip(),
+            "protocol": proto_out,
+            "group": group,
+            "description": desc,
+            "identity": identity,
+        })
+    return sessions
+
+
+# -------------------------------------------------------------------- PuTTY
+
+def import_putty_reg(path: Path) -> list:
+    """Parse a regedit .reg export of PuTTY's Sessions subtree."""
+    sessions = []
+    try:
+        raw = path.read_text(encoding="utf-16", errors="replace")
+        if "SimonTatham" not in raw:
+            raise ValueError
+    except (OSError, ValueError, UnicodeError):
+        raw = path.read_text(encoding="utf-8", errors="replace")
+
+    blocks = re.split(r"^\[", raw, flags=re.M)
+    for block in blocks:
+        if "SimonTatham" not in block or "Sessions" not in block:
+            continue
+        header, _, body = block.partition("]")
+        m = re.search(r"Sessions\\([^\]]+)", header)
+        if not m:
+            continue
+        name = urllib.parse.unquote(m.group(1).replace("%20", " "))
+
+        def sval(key):
+            mm = re.search(r'^"%s"="(.*)"$' % re.escape(key), body, flags=re.M)
+            return mm.group(1) if mm else ""
+
+        def dval(key, default=0):
+            mm = re.search(r'^"%s"=dword:([0-9a-fA-F]+)$' % re.escape(key),
+                           body, flags=re.M)
+            return int(mm.group(1), 16) if mm else default
+
+        host = sval("HostName").strip()
+        if not host:
+            continue
+        proto = (sval("Protocol") or "ssh").lower()
+        if proto not in ("ssh", "telnet"):
+            continue
+
+        sessions.append({
+            "name": name,
+            "host": host,
+            "port": dval("PortNumber", 22 if proto == "ssh" else 23),
+            "user": sval("UserName").strip(),
+            "protocol": proto,
+            "group": "",
+            "description": "",
+            "identity": "",
+        })
+    return sessions
+
+
+def import_putty_dir(root: Path) -> list:
+    """Linux PuTTY stores one plain file per session under ~/.putty/sessions."""
+    sessions = []
+    for path in sorted(root.glob("*")):
+        if not path.is_file():
+            continue
+        cfg = {}
+        for line in path.read_text(errors="replace").splitlines():
+            k, _, v = line.partition("=")
+            cfg[k.strip()] = v.strip()
+        host = cfg.get("HostName", "").strip()
+        if not host:
+            continue
+        proto = cfg.get("Protocol", "ssh").lower()
+        if proto not in ("ssh", "telnet"):
+            continue
+        try:
+            port = int(cfg.get("PortNumber", 22))
+        except ValueError:
+            port = 22
+        sessions.append({
+            "name": urllib.parse.unquote(path.name.replace("%20", " ")),
+            "host": host,
+            "port": port,
+            "user": cfg.get("UserName", "").strip(),
+            "protocol": proto,
+            "group": "",
+            "description": "",
+            "identity": "",
+        })
+    return sessions
+
+
+# --------------------------------------------------------------------------
+# Generic JSON
+#
+# Accepts either a bare list of sessions or {"sessions": [...]}. Field names
+# are matched leniently so hand-written files and other tools' exports both
+# work: host/hostname/address/ip, user/username/login, etc.
+
+JSON_ALIASES = {
+    "name":        ("name", "title", "label", "session", "displayname"),
+    "host":        ("host", "hostname", "address", "ip", "target", "server"),
+    "port":        ("port", "portnumber"),
+    "user":        ("user", "username", "login", "account"),
+    "protocol":    ("protocol", "proto", "type"),
+    "group":       ("group", "folder", "path", "category", "parent"),
+    "description": ("description", "descr", "comment", "notes"),
+    "identity":    ("identity", "keyfile", "key", "identityfile", "privatekey"),
+}
+
+
+def _pick(d, names, default=""):
+    """First present, non-empty value among `names`, case-insensitively."""
+    lower = {str(k).lower(): v for k, v in d.items()}
+    for n in names:
+        v = lower.get(n)
+        if v not in (None, ""):
+            return v
+    return default
+
+
+def _normalize_record(rec):
+    """Map one loosely-shaped dict onto our session schema. None if no host."""
+    host = str(_pick(rec, JSON_ALIASES["host"])).strip()
+    if not host:
+        return None
+
+    try:
+        port = int(str(_pick(rec, JSON_ALIASES["port"], 22)).strip() or 22)
+    except ValueError:
+        port = 22
+
+    proto = str(_pick(rec, JSON_ALIASES["protocol"], "ssh")).strip().lower()
+    if proto not in ("ssh", "telnet"):
+        proto = "telnet" if "telnet" in proto else "ssh"
+
+    # Groups may arrive as a list of path segments or a delimited string.
+    group = _pick(rec, JSON_ALIASES["group"])
+    if isinstance(group, (list, tuple)):
+        group = "/".join(str(g) for g in group if g)
+    group = str(group).strip().strip("/").replace("\\", "/")
+
+    name = str(_pick(rec, JSON_ALIASES["name"], host)).strip() or host
+
+    return {
+        "name": name,
+        "host": host,
+        "port": port,
+        "user": str(_pick(rec, JSON_ALIASES["user"])).strip(),
+        "protocol": proto,
+        "group": group,
+        "description": str(_pick(rec, JSON_ALIASES["description"])).strip(),
+        "identity": str(_pick(rec, JSON_ALIASES["identity"])).strip(),
+    }
+
+
+def import_json(path: Path):
+    """Import a JSON file: a list, or {"sessions": [...]}, or a nested tree."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"{path}: invalid JSON ({e})")
+
+    sessions = []
+
+    def walk(node, prefix=""):
+        """Recurse so nested folder structures keep their hierarchy."""
+        if isinstance(node, list):
+            for item in node:
+                walk(item, prefix)
+            return
+        if not isinstance(node, dict):
+            return
+
+        # A folder node: recurse into its children, extending the group path.
+        kids = None
+        for key in ("children", "sessions", "items", "nodes", "folders"):
+            if isinstance(node.get(key), list):
+                kids = node[key]
+                break
+        if kids is not None:
+            label = str(_pick(node, ("name", "title", "label", "folder"), "")).strip()
+            # A top-level {"sessions": [...]} wrapper is not itself a folder.
+            child_prefix = f"{prefix}/{label}" if (label and prefix) else (label or prefix)
+            for item in kids:
+                walk(item, child_prefix)
+            # A node may carry BOTH children and its own connection details.
+            if not _pick(node, JSON_ALIASES["host"]):
+                return
+
+        rec = _normalize_record(node)
+        if rec:
+            if prefix and not rec["group"]:
+                rec["group"] = prefix.strip("/")
+            elif prefix:
+                rec["group"] = f"{prefix.strip('/')}/{rec['group']}"
+            sessions.append(rec)
+
+    walk(doc)
+    return sessions
+
+
+# --------------------------------------------------------------------------
+# XML (mRemoteNG, SecureCRT XML export, and generic session XML)
+#
+# Rather than target one schema, walk the tree: any element carrying a
+# hostname-ish attribute becomes a session, and container elements contribute
+# their name to the group path. This covers mRemoteNG's <Node>/<Container>
+# layout and most hand-rolled exports.
+
+XML_HOST_ATTRS = ("hostname", "host", "address", "ip", "server", "target")
+XML_CONTAINER_TAGS = ("container", "folder", "group", "node", "nodes",
+                      "connections", "sessions", "root")
+
+
+def _xml_attr(el, names, default=""):
+    lower = {str(k).lower(): v for k, v in el.attrib.items()}
+    for n in names:
+        v = lower.get(n)
+        if v not in (None, ""):
+            return v
+    return default
+
+
+def import_xml(path: Path):
+    """Import mRemoteNG / SecureCRT XML / generic session XML."""
+    try:
+        root_el = ET.parse(str(path)).getroot()
+    except ET.ParseError as e:
+        raise SystemExit(f"{path}: invalid XML ({e})")
+
+    sessions = []
+
+    # The document root is a wrapper ("Connections", "Sessions", …), not a
+    # real folder — starting the group path at it would prefix every session
+    # with a meaningless level.
+    def walk(el, prefix="", is_root=False):
+        host = _xml_attr(el, XML_HOST_ATTRS)
+        name = _xml_attr(el, ("name", "title", "label", "description"))
+        tag = el.tag.lower().split("}")[-1]  # strip any namespace
+
+        is_container = (
+            not host
+            and (tag in XML_CONTAINER_TAGS or len(el) > 0)
+            and _xml_attr(el, ("type",)).lower() != "connection"
+        )
+
+        if host:
+            rec = _normalize_record({
+                "name": name or host,
+                "host": host,
+                "port": _xml_attr(el, ("port", "portnumber"), 22),
+                "user": _xml_attr(el, ("username", "user", "login")),
+                "protocol": _xml_attr(el, ("protocol", "proto"), "ssh"),
+                "description": _xml_attr(el, ("descr", "description", "comment")),
+                "identity": _xml_attr(el, ("identityfile", "keyfile", "key")),
+            })
+            if rec:
+                rec["group"] = prefix.strip("/")
+                sessions.append(rec)
+
+        # Recurse regardless: mRemoteNG nodes can hold both a connection and
+        # children. Only named, non-root containers extend the group path.
+        child_prefix = prefix
+        if is_container and name and not is_root:
+            child_prefix = f"{prefix}/{name}" if prefix else name
+        for kid in el:
+            walk(kid, child_prefix)
+
+    walk(root_el, "", True)
+    return sessions
+
+
+# --------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("source", help="SecureCRT Sessions dir, PuTTY .reg file, "
+                                   "~/.putty/sessions dir, or a .json / .xml export")
+    ap.add_argument("-o", "--out", default=str(DEFAULT_OUT), help=f"output JSON (default {DEFAULT_OUT})")
+    ap.add_argument("--format", choices=["auto", "securecrt", "putty-reg", "putty-dir",
+                                         "json", "xml"],
+                    default="auto")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge into existing output instead of replacing")
+    ap.add_argument("--default-user", default="",
+                    help="fill in this username where the export has none")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    src = Path(os.path.expanduser(args.source))
+    fmt = args.format
+    if fmt == "auto":
+        suffix = src.suffix.lower()
+        if src.is_file() and suffix == ".reg":
+            fmt = "putty-reg"
+        elif src.is_file() and suffix == ".json":
+            fmt = "json"
+        elif src.is_file() and suffix in (".xml", ".confcons"):
+            fmt = "xml"
+        elif src.is_dir() and (src / "__FolderData__.ini").exists():
+            fmt = "securecrt"
+        elif src.is_dir() and list(src.rglob("*.ini")):
+            fmt = "securecrt"
+        elif src.is_dir():
+            fmt = "putty-dir"
+        else:
+            raise SystemExit(f"Cannot detect format for {src}; pass --format")
+
+    if fmt == "securecrt":
+        sessions = import_securecrt(src)
+    elif fmt == "putty-reg":
+        sessions = import_putty_reg(src)
+    elif fmt == "json":
+        sessions = import_json(src)
+    elif fmt == "xml":
+        sessions = import_xml(src)
+    else:
+        sessions = import_putty_dir(src)
+
+    if args.default_user:
+        for s in sessions:
+            if not s["user"]:
+                s["user"] = args.default_user
+
+    out_path = Path(os.path.expanduser(args.out))
+    existing = []
+    if args.merge and out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text()).get("sessions", [])
+        except (OSError, ValueError):
+            existing = []
+
+    # Dedupe on (group, name); later wins.
+    merged = {}
+    for s in existing + sessions:
+        merged[(s.get("group", ""), s.get("name", ""))] = s
+    final = sorted(merged.values(), key=lambda s: (s.get("group", ""), s.get("name", "")))
+
+    doc = {"version": 1, "sessions": final}
+    blob = json.dumps(doc, indent=2, ensure_ascii=False)
+
+    groups = {}
+    for s in final:
+        groups[s.get("group") or "(ungrouped)"] = groups.get(s.get("group") or "(ungrouped)", 0) + 1
+
+    if args.dry_run:
+        print(blob)
+    else:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out_path.with_suffix(".json.tmp")
+        tmp.write_text(blob)
+        os.chmod(tmp, 0o600)
+        tmp.replace(out_path)
+
+    print(f"\n{len(final)} sessions -> {out_path if not args.dry_run else '(dry run)'}",
+          file=sys.stderr)
+    for g in sorted(groups):
+        print(f"  {groups[g]:4d}  {g}", file=sys.stderr)
+    print("\nNo passwords were imported (by design).", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

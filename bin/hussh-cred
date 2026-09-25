@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# hussh-cred — manage the in-RAM TACACS credential.
+#
+#   hussh-cred status            -> "locked" | "unlocked <seconds-left>"
+#   hussh-cred unlock <minutes>  -> reads password from STDIN, caches it
+#   hussh-cred lock              -> wipes it immediately
+#
+# The password is read from stdin (never argv, so it cannot appear in
+# /proc/<pid>/cmdline or your shell history) and stored in the kernel user
+# keyring with a hard expiry. Reboot, logout, or expiry all clear it.
+
+set -euo pipefail
+KEY_DESC="hussh:tacacs"
+
+cmd="${1:-status}"
+
+case "$cmd" in
+  status)
+    if id="$(keyctl search @u user "$KEY_DESC" 2>/dev/null)"; then
+      hex="$(printf '%08x' "$id")"
+      ttl="$(awk -v k="$hex" '$1 == k {print $4; exit}' /proc/keys 2>/dev/null || true)"
+      echo "unlocked ${ttl:-?}"
+    else
+      echo "locked"
+    fi
+    ;;
+
+  unlock)
+    mins="${2:-60}"
+    # Read the secret from stdin; strip a single trailing newline only.
+    IFS= read -r -s secret || true
+    if [[ -z "$secret" ]]; then
+      echo "empty password, nothing cached" >&2
+      exit 1
+    fi
+    # Revoke any previous copy first.
+    if old="$(keyctl search @u user "$KEY_DESC" 2>/dev/null)"; then
+      keyctl revoke "$old" 2>/dev/null || true
+    fi
+    id="$(printf '%s' "$secret" | keyctl padd user "$KEY_DESC" @u)"
+    unset secret
+    keyctl timeout "$id" $(( mins * 60 ))
+    echo "cached for ${mins}m"
+    ;;
+
+  lock)
+    if id="$(keyctl search @u user "$KEY_DESC" 2>/dev/null)"; then
+      keyctl revoke "$id"
+      echo "locked"
+    else
+      echo "already locked"
+    fi
+    ;;
+
+  *)
+    echo "usage: hussh-cred {status|unlock <minutes>|lock}" >&2
+    exit 2
+    ;;
+esac
