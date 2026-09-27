@@ -21,17 +21,66 @@ PROTO="${4:-ssh}"
 TITLE="${5:-$HOST}"
 IDENTITY="${6:-}"
 
+# ---- validate untrusted fields ------------------------------------------
+# host/user/identity all originate in an imported session file, which may
+# come from a colleague or a shared drive. A value beginning with "-" is
+# parsed by ssh/telnet as an OPTION, not a destination: "-ntrace" makes
+# telnet write an attacker-named tracefile, and the -o family reaches
+# further still. We pass "--" before the positionals AND reject leading
+# dashes, because the two protect against different mistakes.
+die() { printf 'hussh-connect: %s\n' "$1" >&2; exit 2; }
+
+case "$HOST" in
+  -*) die "refusing host that begins with '-': $HOST" ;;
+esac
+# A hostname or IP literal: letters, digits, dot, hyphen, colon (IPv6),
+# percent (zone id), underscore (seen in the wild). Nothing else — no
+# whitespace, quotes, or shell metacharacters.
+if [[ ! "$HOST" =~ ^[A-Za-z0-9._:%-]+$ ]]; then
+  die "refusing host with unexpected characters: $HOST"
+fi
+
+if [[ -n "$USER_NAME" ]]; then
+  case "$USER_NAME" in
+    -*) die "refusing username that begins with '-': $USER_NAME" ;;
+  esac
+  # No '@' — it would re-split the user@host target and redirect the session.
+  if [[ ! "$USER_NAME" =~ ^[A-Za-z0-9._\\-]+$ ]]; then
+    die "refusing username with unexpected characters: $USER_NAME"
+  fi
+fi
+
+if [[ -n "$IDENTITY" ]]; then
+  case "$IDENTITY" in
+    -*) die "refusing identity path that begins with '-': $IDENTITY" ;;
+  esac
+fi
+
+case "$PORT" in
+  ''|*[!0-9]*) die "refusing non-numeric port: $PORT" ;;
+esac
+if (( PORT < 1 || PORT > 65535 )); then
+  die "port out of range: $PORT"
+fi
+
+case "$PROTO" in
+  ssh|telnet) ;;
+  *) die "unsupported protocol: $PROTO" ;;
+esac
+
 KEY_DESC="hussh:tacacs"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ASKPASS="$SELF_DIR/hussh-askpass"
 
 # ---- build the remote command -------------------------------------------
 if [[ "$PROTO" == "telnet" ]]; then
-  REMOTE_CMD=(telnet "$HOST" "$PORT")
+  REMOTE_CMD=(telnet -- "$HOST" "$PORT")
 else
   REMOTE_CMD=(ssh -p "$PORT")
   [[ -n "$IDENTITY" ]] && REMOTE_CMD+=(-i "$IDENTITY" -o IdentitiesOnly=yes)
   # Old switches: let the system ssh_config decide on legacy algorithms.
+  # "--" ends option parsing so the target can never be read as a flag.
+  REMOTE_CMD+=(--)
   if [[ -n "$USER_NAME" ]]; then
     REMOTE_CMD+=("${USER_NAME}@${HOST}")
   else
@@ -81,7 +130,7 @@ if (( NEEDS_LEARN )); then
   # Target string, matching how REMOTE_CMD addresses the host above.
   if [[ -n "$USER_NAME" ]]; then LEARN_TARGET="${USER_NAME}@${HOST}"; else LEARN_TARGET="$HOST"; fi
   LEARN=(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=ask
-         -o NumberOfPasswordPrompts=0 -p "$PORT" "$LEARN_TARGET" -- exit)
+         -o NumberOfPasswordPrompts=0 -p "$PORT" -- "$LEARN_TARGET" exit)
   INNER+='echo "[huSSH] First connection to this host — verify the fingerprint below."; echo; '
   for a in "${LEARN[@]}"; do INNER+=" $(printf '%q' "$a")"; done
   # NumberOfPasswordPrompts=0 means this probe always ends in an auth failure

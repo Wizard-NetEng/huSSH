@@ -49,6 +49,26 @@ Item {
     return t.length > maxLen ? t.slice(0, maxLen) : t
   }
 
+  // A host/user/identity that begins with "-" is read as an OPTION by ssh
+  // and telnet, not as a destination. hussh-connect refuses these too; this
+  // is the UI-side half, so a hostile entry never even renders as clickable
+  // rather than failing only at launch time.
+  function safeTarget(s) {
+    if (!s) return ""
+    var t = String(s)
+    if (t.charAt(0) === "-") return ""
+    if (!/^[A-Za-z0-9._:%-]+$/.test(t)) return ""
+    return t
+  }
+
+  function safeUser(s) {
+    if (!s) return ""
+    var t = String(s)
+    if (t.charAt(0) === "-") return ""
+    if (!/^[A-Za-z0-9._-]+$/.test(t)) return ""
+    return t
+  }
+
   function keyOf(s) { return s.host + ":" + s.port }
 
   // true / false / undefined (never probed)
@@ -200,26 +220,31 @@ Item {
 
   function parseSessions(raw) {
     var out = []
+    var skipped = 0
     try {
       var doc = JSON.parse(raw || "{}")
       var list = doc.sessions || []
       for (var i = 0; i < list.length && i < 2000; i++) {
         var s = list[i]
         if (!s || !s.host) continue
+        var host = safeTarget(sanitize(s.host, 255))
+        if (!host) { skipped++; continue }   // option-like or malformed host
         var port = parseInt(s.port, 10)
         if (!isFinite(port) || port <= 0 || port > 65535) port = 22
         out.push({
-          name: sanitize(s.name || s.host, 96),
-          host: sanitize(s.host, 255),
+          name: sanitize(s.name || host, 96),
+          host: host,
           port: port,
-          user: sanitize(s.user || "", 64),
+          user: safeUser(sanitize(s.user || "", 64)),
           protocol: (s.protocol === "telnet") ? "telnet" : "ssh",
           group: sanitize(s.group || "", 160),
           description: sanitize(s.description || "", 160),
-          identity: sanitize(s.identity || "", 255)
+          identity: safeTarget(sanitize(s.identity || "", 255))
         })
       }
-      root.lastError = ""
+      root.lastError = skipped > 0
+        ? (skipped + " session(s) skipped: unsafe host or username")
+        : ""
     } catch (e) {
       root.lastError = "sessions.json is not valid JSON"
     }
@@ -344,12 +369,21 @@ Item {
   // ---- connect -----------------------------------------------------------
   function connect(s) {
     if (!s || !s.host) return
+    // Re-validate at the launch boundary. parseSessions already filtered,
+    // but connect() is callable from the Panel with any object, and the
+    // cost of checking twice is nil next to launching a crafted target.
+    var host = safeTarget(s.host)
+    if (!host) { root.lastError = "Refusing unsafe host: " + sanitize(s.host, 64); return }
     // Sessions imported without a username fall back to the configured
     // default, so you set it once instead of editing every entry.
-    var user = String(s.user || "").trim() || root.defaultUser
+    var user = safeUser(String(s.user || "").trim() || root.defaultUser)
+    var ident = safeTarget(s.identity || "")
+    var port = parseInt(s.port, 10)
+    if (!isFinite(port) || port <= 0 || port > 65535) port = 22
     Quickshell.execDetached([
       root.binDir + "hussh-connect",
-      s.host, String(s.port), user, s.protocol, s.name, s.identity || ""
+      host, String(port), user, (s.protocol === "telnet" ? "telnet" : "ssh"),
+      sanitize(s.name || host, 96), ident
     ])
   }
 

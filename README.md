@@ -153,6 +153,28 @@ Connecting to a host you have not seen before happens in two phases:
 The result: one `yes` per new device, one password per unlock window, and no
 credential ever written down. Fingerprints are never auto-accepted.
 
+The askpass helper answers **only** a prompt that ends in `password:`. It
+refuses key passphrases (a different secret), host-key and fingerprint
+questions, and anything carrying a warning marker — notably
+`REMOTE HOST IDENTIFICATION HAS CHANGED`, which ends in a password prompt and
+must never be auto-answered, since that is precisely the case where the host
+may not be the one you think.
+
+The hold window must be between 1 and 1440 minutes. A credential is never
+cached without an expiry: if the timeout cannot be applied it is discarded
+rather than left resident.
+
+### Session field validation
+
+Imported host, username, and identity values are validated before any
+connection is launched. A value beginning with `-` is rejected, because `ssh`
+and `telnet` parse it as an **option** rather than a destination — `-ntrace`
+makes telnet write an attacker-named file, and the `-o` family reaches further.
+Hosts are restricted to hostname/IP characters, usernames may not contain `@`
+(it would redirect the target), and `--` terminates option parsing on every
+command built. Sessions failing these checks are skipped and reported in the
+popup rather than shown as clickable.
+
 Lock it early with the lock icon, `u`, or:
 
 ```bash

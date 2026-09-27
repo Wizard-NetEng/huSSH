@@ -82,6 +82,26 @@ def _append(sessions: list, rec, path=None):
     sessions.append(rec)
 
 
+def _collect_capped(paths, root, what="files"):
+    """Materialize at most MAX_SOURCE_FILES paths from a lazy glob, sorted.
+
+    The ceiling has to be applied while CONSUMING the generator. Wrapping the
+    glob in sorted() first builds the entire path list in memory before any
+    per-item check can run, so a directory with tens of millions of entries
+    exhausts memory before the limit is ever reached — the sort is what
+    materializes it, not the loop.
+    """
+    out = []
+    for p in paths:
+        if len(out) >= MAX_SOURCE_FILES:
+            raise ImportLimit(
+                f"{root}: more than {MAX_SOURCE_FILES} {what}; raise "
+                f"HUSSH_IMPORT_MAX_FILES if that is intended")
+        out.append(p)
+    out.sort()
+    return out
+
+
 
 # ---------------------------------------------------------------- SecureCRT
 
@@ -135,15 +155,9 @@ def import_securecrt(root: Path) -> list:
     if not root.exists():
         raise SystemExit(f"SecureCRT sessions dir not found: {root}")
 
-    scanned = 0
-    for path in sorted(root.rglob("*.ini")):
+    for path in _collect_capped(root.rglob("*.ini"), root, ".ini files"):
         if path.name == "__FolderData__.ini":
             continue
-        scanned += 1
-        if scanned > MAX_SOURCE_FILES:
-            raise ImportLimit(
-                f"{root}: more than {MAX_SOURCE_FILES} .ini files; raise "
-                f"HUSSH_IMPORT_MAX_FILES if that is intended")
         cfg = _crt_parse_ini(path)
         if not cfg:
             continue
@@ -254,15 +268,9 @@ def import_putty_reg(path: Path) -> list:
 def import_putty_dir(root: Path) -> list:
     """Linux PuTTY stores one plain file per session under ~/.putty/sessions."""
     sessions = []
-    scanned = 0
-    for path in sorted(root.glob("*")):
+    for path in _collect_capped(root.glob("*"), root, "session files"):
         if not path.is_file():
             continue
-        scanned += 1
-        if scanned > MAX_SOURCE_FILES:
-            raise ImportLimit(
-                f"{root}: more than {MAX_SOURCE_FILES} session files; raise "
-                f"HUSSH_IMPORT_MAX_FILES if that is intended")
         cfg = {}
         try:
             text = _read_text_capped(path)
@@ -533,7 +541,11 @@ def main():
             fmt = "xml"
         elif src.is_dir() and (src / "__FolderData__.ini").exists():
             fmt = "securecrt"
-        elif src.is_dir() and list(src.rglob("*.ini")):
+        elif src.is_dir() and next(src.rglob("*.ini"), None) is not None:
+            # next() on the lazy generator: this only asks "is there at least
+            # one?", so it stops at the first hit. list(...) here would have
+            # materialized every match in a huge tree purely to test emptiness,
+            # before either importer's file ceiling could run.
             fmt = "securecrt"
         elif src.is_dir():
             fmt = "putty-dir"

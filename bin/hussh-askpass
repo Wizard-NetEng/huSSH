@@ -2,21 +2,51 @@
 # hussh-askpass — SSH_ASKPASS helper. Prints the cached TACACS password on
 # stdout, once, straight from the kernel keyring. Never touches disk.
 #
-# ssh calls this with the prompt text as $1. We only answer password-style
-# prompts; anything else (host key confirmation, etc.) we decline so the
-# user sees it in the terminal and answers deliberately.
+# ssh calls this with the prompt text as $1. We answer ONLY a genuine
+# password prompt. Everything else is declined so the user sees it in the
+# terminal and answers deliberately.
+#
+# Matching is deliberately strict, because SSH_ASKPASS_REQUIRE=force routes
+# EVERY prompt here, including ones that must never be auto-answered:
+#
+#   - A substring match on "password" also matches the host-key-changed
+#     warning ("REMOTE HOST IDENTIFICATION HAS CHANGED ... password:"),
+#     handing the credential to whatever is now answering on that address.
+#     That is the exact scenario the warning exists to stop.
+#   - "Enter passphrase for key ..." is a LOCAL key passphrase, not the
+#     TACACS password. Feeding it the wrong secret is useless, and on a
+#     shared/HSM-backed key it is a leak to the wrong consumer.
+#
+# So: refuse anything carrying a warning marker, then require the prompt to
+# LOOK like a terminal password prompt (ends at "password:" modulo trailing
+# space), rather than merely containing the word.
 
 set -euo pipefail
 KEY_DESC="hussh:tacacs"
 PROMPT="${1:-}"
 
+# Any of these means "this is not a routine password prompt" — bail out
+# before the positive match gets a chance.
 case "$PROMPT" in
-  *[Pp]assword*|*PASSWORD*)
-    id="$(keyctl search @u user "$KEY_DESC" 2>/dev/null)" || exit 1
-    keyctl pipe "$id" 2>/dev/null || exit 1
-    ;;
-  *)
-    # Host key prompts and friends: refuse, let ssh fall back to the tty.
-    exit 1
-    ;;
+  *"IDENTIFICATION HAS CHANGED"*|*WARNING*|*Warning*|*warning*)
+    exit 1 ;;
+  *"host key"*|*"Host key"*|*"HOST KEY"*|*fingerprint*|*Fingerprint*)
+    exit 1 ;;
+  *"(yes/no"*|*"continue connecting"*)
+    exit 1 ;;
+  *passphrase*|*Passphrase*|*PASSPHRASE*)
+    exit 1 ;;
 esac
+
+# Positive match: the prompt must END with "password:" (optionally followed
+# by whitespace). Covers "joe@rtr1's password:" and "(joe@10.0.0.1) Password:"
+# while rejecting prose that merely mentions a password.
+shopt -s nocasematch
+if [[ "$PROMPT" =~ password:[[:space:]]*$ ]]; then
+  id="$(keyctl search @u user "$KEY_DESC" 2>/dev/null)" || exit 1
+  keyctl pipe "$id" 2>/dev/null || exit 1
+  exit 0
+fi
+
+# Anything else: refuse, let ssh fall back to the tty.
+exit 1

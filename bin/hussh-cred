@@ -26,7 +26,24 @@ case "$cmd" in
     ;;
 
   unlock)
+    # The hold window must be a sane positive integer. Three failure modes
+    # in the previous version, all of which defeat the security model:
+    #   "0"    -> keyctl timeout 0 means NO expiry: the password stays in
+    #             the keyring until logout. The whole point is self-expiry.
+    #   "-5"   -> a negative value wraps to a ~135-year timeout.
+    #   "abc"  -> $(( )) on a non-numeric string aborts under `set -u`,
+    #             AFTER the key was already added, leaving it permanent.
+    # Validate BEFORE touching the keyring, so a bad argument can never
+    # leave a credential cached without an expiry.
     mins="${2:-60}"
+    if [[ ! "$mins" =~ ^[0-9]+$ ]]; then
+      echo "unlock: minutes must be a positive integer (got '$mins')" >&2
+      exit 2
+    fi
+    if (( mins < 1 || mins > 1440 )); then
+      echo "unlock: minutes must be between 1 and 1440 (got $mins)" >&2
+      exit 2
+    fi
     # Read the secret from stdin; strip a single trailing newline only.
     IFS= read -r -s secret || true
     if [[ -z "$secret" ]]; then
@@ -39,7 +56,13 @@ case "$cmd" in
     fi
     id="$(printf '%s' "$secret" | keyctl padd user "$KEY_DESC" @u)"
     unset secret
-    keyctl timeout "$id" $(( mins * 60 ))
+    # If the timeout cannot be applied, the key must not survive: a cached
+    # credential that never expires is worse than no cache at all.
+    if ! keyctl timeout "$id" $(( mins * 60 )); then
+      keyctl revoke "$id" 2>/dev/null || true
+      echo "could not set expiry; credential discarded" >&2
+      exit 1
+    fi
     echo "cached for ${mins}m"
     ;;
 

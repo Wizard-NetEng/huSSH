@@ -21,8 +21,36 @@ SESSIONS = Path(os.environ.get(
     "HUSSH_SESSIONS",
     Path.home() / ".config" / "omarchy" / "hussh" / "sessions.json"))
 
-TIMEOUT = float(os.environ.get("HUSSH_PROBE_TIMEOUT", "1.5"))
-WORKERS = int(os.environ.get("HUSSH_PROBE_WORKERS", "64"))
+# Bounded like the importer: this reads the same session inventory, and a
+# reader that trusts its input because "we wrote it" is exactly the habit
+# that produced the import findings. 32 MB is far beyond any real inventory.
+MAX_BYTES = max(1, int(os.environ.get("HUSSH_PROBE_MAX_BYTES", 32 * 1024 * 1024)))
+MAX_TARGETS = max(1, int(os.environ.get("HUSSH_PROBE_MAX_TARGETS", 20000)))
+
+
+def _clamp_float(name, default, lo, hi):
+    """Env values reach here from the settings file; never trust them raw."""
+    try:
+        v = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return max(lo, min(hi, v))
+
+
+def _clamp_int(name, default, lo, hi):
+    try:
+        v = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+# A timeout of 0 makes every connect fail instantly and paints the whole
+# list unreachable; a huge worker count is a thread-exhaustion foot-gun.
+TIMEOUT = _clamp_float("HUSSH_PROBE_TIMEOUT", 1.5, 0.1, 30.0)
+WORKERS = _clamp_int("HUSSH_PROBE_WORKERS", 64, 1, 256)
 
 
 def check(target):
@@ -36,13 +64,36 @@ def check(target):
 
 def main():
     try:
-        doc = json.loads(SESSIONS.read_text())
+        size = SESSIONS.stat().st_size
+        if size > MAX_BYTES:
+            raise ValueError(f"sessions.json exceeds {MAX_BYTES} bytes")
+        with open(SESSIONS, "rb") as fh:
+            blob = fh.read(MAX_BYTES + 1)
+        if len(blob) > MAX_BYTES:
+            raise ValueError(f"sessions.json exceeds {MAX_BYTES} bytes")
+        doc = json.loads(blob.decode("utf-8", errors="replace"))
     except (OSError, ValueError) as e:
         print(json.dumps({"_error": str(e)}))
         return 1
 
-    targets = sorted({(s["host"], int(s.get("port", 22)))
-                      for s in doc.get("sessions", []) if s.get("host")})
+    if not isinstance(doc, dict):
+        print(json.dumps({"_error": "sessions.json is not an object"}))
+        return 1
+
+    targets = set()
+    for s in doc.get("sessions", []) or []:
+        if not isinstance(s, dict) or not s.get("host"):
+            continue
+        try:
+            port = int(s.get("port", 22))
+        except (TypeError, ValueError):
+            continue
+        if not (0 < port < 65536):
+            continue
+        targets.add((str(s["host"]), port))
+        if len(targets) >= MAX_TARGETS:
+            break
+    targets = sorted(targets)
     if not targets:
         print(json.dumps({}))
         return 0
