@@ -84,6 +84,29 @@ bin/hussh-import ~/putty-export.reg                  # PuTTY
 bin/hussh-import ~/more.xml --merge                  # add to existing
 ```
 
+### Import limits
+
+Imported files come from elsewhere — a colleague's export, a shared drive — so
+the importer refuses pathological input rather than reading it unbounded. It
+stops with a clear message (leaving any existing `sessions.json` untouched) when
+a source exceeds:
+
+| Limit | Default | Override |
+|---|---|---|
+| Input file size | 32 MB | `HUSSH_IMPORT_MAX_BYTES` |
+| Sessions in one import | 20000 | `HUSSH_IMPORT_MAX_RECORDS` |
+| Files in a scanned directory | 20000 | `HUSSH_IMPORT_MAX_FILES` |
+| JSON/XML nesting depth | 64 | `HUSSH_IMPORT_MAX_DEPTH` |
+
+XML with a `DOCTYPE` or entity declaration is refused outright: no real session
+export needs one, and it is the vector for entity-expansion attacks.
+
+If you genuinely have an inventory that large, raise the relevant ceiling:
+
+```bash
+HUSSH_IMPORT_MAX_RECORDS=50000 bin/hussh-import ~/huge.xml
+```
+
 ### JSON format
 
 A bare list, or `{"sessions": [...]}`. Field names are matched leniently —

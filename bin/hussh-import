@@ -22,6 +22,66 @@ from pathlib import Path
 
 DEFAULT_OUT = Path.home() / ".config" / "omarchy" / "hussh" / "sessions.json"
 
+# ------------------------------------------------------------------- limits
+#
+# An import source is attacker-influenced whenever it arrives from elsewhere —
+# a colleague's export, a shared drive, a repo. Reading one unbounded is a
+# memory-exhaustion primitive, so every reader here is bounded twice: by input
+# bytes (stat AND read, since a growing file or a FIFO beats stat alone) and by
+# record count. Raise the ceilings via the environment for a genuinely huge
+# inventory.
+
+MAX_INPUT_BYTES = max(1, int(os.environ.get("HUSSH_IMPORT_MAX_BYTES", 32 * 1024 * 1024)))
+MAX_RECORDS = max(1, int(os.environ.get("HUSSH_IMPORT_MAX_RECORDS", 20000)))
+MAX_SOURCE_FILES = max(1, int(os.environ.get("HUSSH_IMPORT_MAX_FILES", 20000)))
+MAX_DEPTH = max(1, int(os.environ.get("HUSSH_IMPORT_MAX_DEPTH", 64)))
+
+_SIZE_HINT = "raise HUSSH_IMPORT_MAX_BYTES if this file is legitimately that large"
+
+
+class ImportLimit(Exception):
+    """A bound was exceeded. Fatal for a single file, skippable in a sweep."""
+
+
+def _read_bytes_capped(path: Path) -> bytes:
+    """Read at most MAX_INPUT_BYTES, checking stat first and the read after."""
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        raise ImportLimit(f"{path}: cannot stat ({e})")
+    if size > MAX_INPUT_BYTES:
+        raise ImportLimit(
+            f"{path}: {size} bytes exceeds the {MAX_INPUT_BYTES}-byte import "
+            f"limit; {_SIZE_HINT}")
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(MAX_INPUT_BYTES + 1)
+    except OSError as e:
+        raise ImportLimit(f"{path}: cannot read ({e})")
+    if len(data) > MAX_INPUT_BYTES:
+        # stat lied: a FIFO, /proc file, or a file growing under us.
+        raise ImportLimit(
+            f"{path}: input exceeds the {MAX_INPUT_BYTES}-byte import limit "
+            f"while reading; {_SIZE_HINT}")
+    return data
+
+
+def _read_text_capped(path: Path, encoding: str = "utf-8",
+                      errors: str = "replace") -> str:
+    return _read_bytes_capped(path).decode(encoding, errors)
+
+
+def _append(sessions: list, rec, path=None):
+    """Append under the record ceiling. Bounds memory even on a small file."""
+    if rec is None:
+        return
+    if len(sessions) >= MAX_RECORDS:
+        raise ImportLimit(
+            f"{path or 'import'}: more than {MAX_RECORDS} sessions; "
+            f"raise HUSSH_IMPORT_MAX_RECORDS if that is intended")
+    sessions.append(rec)
+
+
 
 # ---------------------------------------------------------------- SecureCRT
 
@@ -34,8 +94,9 @@ def _crt_parse_ini(path: Path) -> dict:
     """
     out = {}
     try:
-        raw = path.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
+        raw = _read_text_capped(path, encoding="utf-8-sig")
+    except (OSError, ImportLimit) as e:
+        print(f"skipping {path.name}: {e}", file=sys.stderr)
         return out
     for line in raw.splitlines():
         m = re.match(r'^([SDBZ]):"([^"]+)"=(.*)$', line)
@@ -58,8 +119,8 @@ def _crt_folder_description(folder: Path) -> str:
         return ""
     # Description lives in a Z: blob continuation line
     try:
-        raw = fd.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
+        raw = _read_text_capped(fd, encoding="utf-8-sig")
+    except (OSError, ImportLimit):
         return ""
     lines = raw.splitlines()
     for i, line in enumerate(lines):
@@ -74,9 +135,15 @@ def import_securecrt(root: Path) -> list:
     if not root.exists():
         raise SystemExit(f"SecureCRT sessions dir not found: {root}")
 
+    scanned = 0
     for path in sorted(root.rglob("*.ini")):
         if path.name == "__FolderData__.ini":
             continue
+        scanned += 1
+        if scanned > MAX_SOURCE_FILES:
+            raise ImportLimit(
+                f"{root}: more than {MAX_SOURCE_FILES} .ini files; raise "
+                f"HUSSH_IMPORT_MAX_FILES if that is intended")
         cfg = _crt_parse_ini(path)
         if not cfg:
             continue
@@ -104,13 +171,13 @@ def import_securecrt(root: Path) -> list:
         # Description blob
         desc = ""
         try:
-            raw = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+            raw = _read_text_capped(path, encoding="utf-8-sig").splitlines()
             for i, line in enumerate(raw):
                 if line.startswith('Z:"Description"') and i + 1 < len(raw):
                     if raw[i + 1].startswith(" "):
                         desc = raw[i + 1].strip()
                     break
-        except OSError:
+        except (OSError, ImportLimit):
             pass
 
         identity = (cfg.get("Identity Filename V2") or "").strip()
@@ -118,7 +185,7 @@ def import_securecrt(root: Path) -> list:
         if identity and ("\\" in identity or re.match(r"^[A-Za-z]:", identity)):
             identity = ""
 
-        sessions.append({
+        _append(sessions, {
             "name": path.stem,
             "host": host,
             "port": int(port),
@@ -127,7 +194,7 @@ def import_securecrt(root: Path) -> list:
             "group": group,
             "description": desc,
             "identity": identity,
-        })
+        }, root)
     return sessions
 
 
@@ -136,12 +203,14 @@ def import_securecrt(root: Path) -> list:
 def import_putty_reg(path: Path) -> list:
     """Parse a regedit .reg export of PuTTY's Sessions subtree."""
     sessions = []
-    try:
-        raw = path.read_text(encoding="utf-16", errors="replace")
-        if "SimonTatham" not in raw:
-            raise ValueError
-    except (OSError, ValueError, UnicodeError):
-        raw = path.read_text(encoding="utf-8", errors="replace")
+    # Read the bytes once, then try both encodings against that buffer — the
+    # old code read the whole file a second time on UTF-16 failure, doubling
+    # peak memory for no reason.
+    data = _read_bytes_capped(path)
+    raw = data.decode("utf-16", errors="replace")
+    if "SimonTatham" not in raw:
+        raw = data.decode("utf-8", errors="replace")
+    del data
 
     blocks = re.split(r"^\[", raw, flags=re.M)
     for block in blocks:
@@ -169,7 +238,7 @@ def import_putty_reg(path: Path) -> list:
         if proto not in ("ssh", "telnet"):
             continue
 
-        sessions.append({
+        _append(sessions, {
             "name": name,
             "host": host,
             "port": dval("PortNumber", 22 if proto == "ssh" else 23),
@@ -178,18 +247,29 @@ def import_putty_reg(path: Path) -> list:
             "group": "",
             "description": "",
             "identity": "",
-        })
+        }, path)
     return sessions
 
 
 def import_putty_dir(root: Path) -> list:
     """Linux PuTTY stores one plain file per session under ~/.putty/sessions."""
     sessions = []
+    scanned = 0
     for path in sorted(root.glob("*")):
         if not path.is_file():
             continue
+        scanned += 1
+        if scanned > MAX_SOURCE_FILES:
+            raise ImportLimit(
+                f"{root}: more than {MAX_SOURCE_FILES} session files; raise "
+                f"HUSSH_IMPORT_MAX_FILES if that is intended")
         cfg = {}
-        for line in path.read_text(errors="replace").splitlines():
+        try:
+            text = _read_text_capped(path)
+        except (OSError, ImportLimit) as e:
+            print(f"skipping {path.name}: {e}", file=sys.stderr)
+            continue
+        for line in text.splitlines():
             k, _, v = line.partition("=")
             cfg[k.strip()] = v.strip()
         host = cfg.get("HostName", "").strip()
@@ -202,7 +282,7 @@ def import_putty_dir(root: Path) -> list:
             port = int(cfg.get("PortNumber", 22))
         except ValueError:
             port = 22
-        sessions.append({
+        _append(sessions, {
             "name": urllib.parse.unquote(path.name.replace("%20", " ")),
             "host": host,
             "port": port,
@@ -211,7 +291,7 @@ def import_putty_dir(root: Path) -> list:
             "group": "",
             "description": "",
             "identity": "",
-        })
+        }, root)
     return sessions
 
 
@@ -282,17 +362,25 @@ def _normalize_record(rec):
 def import_json(path: Path):
     """Import a JSON file: a list, or {"sessions": [...]}, or a nested tree."""
     try:
-        doc = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        doc = json.loads(_read_text_capped(path))
     except json.JSONDecodeError as e:
         raise SystemExit(f"{path}: invalid JSON ({e})")
 
     sessions = []
 
-    def walk(node, prefix=""):
-        """Recurse so nested folder structures keep their hierarchy."""
+    def walk(node, prefix="", depth=0):
+        """Recurse so nested folder structures keep their hierarchy.
+
+        Depth is bounded: a deeply nested document would otherwise recurse
+        until the interpreter stack gives out.
+        """
+        if depth > MAX_DEPTH:
+            raise ImportLimit(
+                f"{path}: nesting deeper than {MAX_DEPTH} levels; raise "
+                f"HUSSH_IMPORT_MAX_DEPTH if that is intended")
         if isinstance(node, list):
             for item in node:
-                walk(item, prefix)
+                walk(item, prefix, depth + 1)
             return
         if not isinstance(node, dict):
             return
@@ -308,7 +396,7 @@ def import_json(path: Path):
             # A top-level {"sessions": [...]} wrapper is not itself a folder.
             child_prefix = f"{prefix}/{label}" if (label and prefix) else (label or prefix)
             for item in kids:
-                walk(item, child_prefix)
+                walk(item, child_prefix, depth + 1)
             # A node may carry BOTH children and its own connection details.
             if not _pick(node, JSON_ALIASES["host"]):
                 return
@@ -319,7 +407,7 @@ def import_json(path: Path):
                 rec["group"] = prefix.strip("/")
             elif prefix:
                 rec["group"] = f"{prefix.strip('/')}/{rec['group']}"
-            sessions.append(rec)
+            _append(sessions, rec, path)
 
     walk(doc)
     return sessions
@@ -349,17 +437,36 @@ def _xml_attr(el, names, default=""):
 
 def import_xml(path: Path):
     """Import mRemoteNG / SecureCRT XML / generic session XML."""
+    data = _read_bytes_capped(path)
+
+    # xml.etree expands internal entities, so a few-KB DTD can expand to
+    # gigabytes ("billion laughs"). A byte cap alone does not stop that, and
+    # no legitimate session export needs a DOCTYPE — refuse them outright.
+    head = data[:4096].lstrip()
+    if b"<!DOCTYPE" in head or b"<!ENTITY" in data[:65536]:
+        raise ImportLimit(
+            f"{path}: refusing an XML document with a DTD/entity declaration "
+            f"(entity-expansion risk); export it without a DOCTYPE")
+
     try:
-        root_el = ET.parse(str(path)).getroot()
+        # Parse from the already-bounded buffer rather than reopening the
+        # file, so the size check cannot be bypassed by swapping the file
+        # between the check and the parse.
+        root_el = ET.fromstring(data)
     except ET.ParseError as e:
         raise SystemExit(f"{path}: invalid XML ({e})")
+    del data
 
     sessions = []
 
     # The document root is a wrapper ("Connections", "Sessions", …), not a
     # real folder — starting the group path at it would prefix every session
     # with a meaningless level.
-    def walk(el, prefix="", is_root=False):
+    def walk(el, prefix="", is_root=False, depth=0):
+        if depth > MAX_DEPTH:
+            raise ImportLimit(
+                f"{path}: element nesting deeper than {MAX_DEPTH} levels; "
+                f"raise HUSSH_IMPORT_MAX_DEPTH if that is intended")
         host = _xml_attr(el, XML_HOST_ATTRS)
         name = _xml_attr(el, ("name", "title", "label", "description"))
         tag = el.tag.lower().split("}")[-1]  # strip any namespace
@@ -382,7 +489,7 @@ def import_xml(path: Path):
             })
             if rec:
                 rec["group"] = prefix.strip("/")
-                sessions.append(rec)
+                _append(sessions, rec, path)
 
         # Recurse regardless: mRemoteNG nodes can hold both a connection and
         # children. Only named, non-root containers extend the group path.
@@ -390,7 +497,7 @@ def import_xml(path: Path):
         if is_container and name and not is_root:
             child_prefix = f"{prefix}/{name}" if prefix else name
         for kid in el:
-            walk(kid, child_prefix)
+            walk(kid, child_prefix, False, depth + 1)
 
     walk(root_el, "", True)
     return sessions
@@ -452,15 +559,22 @@ def main():
     out_path = Path(os.path.expanduser(args.out))
     existing = []
     if args.merge and out_path.exists():
+        # Our own previous output, but still bounded: --merge on a file that
+        # grew unexpectedly should not be the one unbounded read left.
         try:
-            existing = json.loads(out_path.read_text()).get("sessions", [])
-        except (OSError, ValueError):
+            existing = json.loads(_read_text_capped(out_path)).get("sessions", [])
+        except (OSError, ValueError, ImportLimit) as e:
+            print(f"ignoring existing {out_path}: {e}", file=sys.stderr)
             existing = []
 
     # Dedupe on (group, name); later wins.
     merged = {}
     for s in existing + sessions:
         merged[(s.get("group", ""), s.get("name", ""))] = s
+    if len(merged) > MAX_RECORDS:
+        raise ImportLimit(
+            f"merged inventory holds {len(merged)} sessions, over the "
+            f"{MAX_RECORDS} limit; raise HUSSH_IMPORT_MAX_RECORDS if intended")
     final = sorted(merged.values(), key=lambda s: (s.get("group", ""), s.get("name", "")))
 
     doc = {"version": 1, "sessions": final}
@@ -474,6 +588,15 @@ def main():
         print(blob)
     else:
         out_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir's mode applies only when it CREATES the directory. A dir left
+        # at 0755 by an older version (or a permissive umask) would otherwise
+        # keep the inventory listable forever, so tighten it every run.
+        try:
+            if (out_path.parent.stat().st_mode & 0o077):
+                out_path.parent.chmod(0o700)
+        except OSError as e:
+            print(f"warning: cannot tighten {out_path.parent}: {e}", file=sys.stderr)
+
         # Session inventory is host/user data: it must never exist on disk in a
         # world-readable state, not even briefly. mkstemp creates with mode 0600
         # atomically (O_CREAT|O_EXCL), so there is no window between create and
@@ -503,4 +626,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ImportLimit as e:
+        # A bound was hit: report it plainly and leave any existing output
+        # untouched, rather than dying in a traceback.
+        raise SystemExit(f"hussh-import: {e}")
+
